@@ -156,28 +156,41 @@ def read_cpu_temp_w_sensors(preferred_label: Optional[str]) -> Optional[float]:
     out = run(["/usr/bin/sensors"])
     if not out:
         return None
-    lines = out.splitlines()
-    if preferred_label:
-        key = preferred_label.rstrip(":")
-        for ln in lines:
-            if ln.strip().startswith(key + ":"):
-                for tok in ln.split():
-                    if any(c.isdigit() for c in tok):
-                        num = "".join(ch for ch in tok if ch.isdigit() or ch == ".")
-                        if num:
-                            try:
-                                return float(num)
-                            except Exception:
-                                pass
+
     import re
-    rx = re.compile(r"([0-9]+(\.[0-9]+)?)\s*°?C")
+    lines = out.splitlines()
+
+    def temp_in(s: str) -> Optional[float]:
+        m = re.search(r'([-+]?\d+(?:\.\d+)?)\s*°?C', s)
+        return float(m.group(1)) if m else None
+
+    # 1) Exact label match, parse only AFTER the first colon
+    if preferred_label:
+        key = preferred_label.rstrip(":").strip()
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith(key + ":"):
+                part = s.split(":", 1)[1]
+                v = temp_in(part)
+                if v is not None:
+                    return v
+
+    # 2) Common labels fallback (still parse only after colon)
+    for lab in [l for l in ["Tctl", "Tdie", "Package id 0", "Composite", "CPU"] if not preferred_label or l != preferred_label.rstrip(":").strip()]:
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith(lab + ":"):
+                part = s.split(":", 1)[1]
+                v = temp_in(part)
+                if v is not None:
+                    return v
+
+    # 3) Last resort: first temperature anywhere
     for ln in lines:
-        m = rx.search(ln)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                continue
+        v = temp_in(ln)
+        if v is not None:
+            return v
+
     return None
 
 def _mount_source_to_target_map() -> Dict[str, str]:
