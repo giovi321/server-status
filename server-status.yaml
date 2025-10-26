@@ -1,0 +1,62 @@
+# server-status config
+modules:
+  cpu_usage: true
+  cpu_temp: true
+  memory: true
+  uptime: true
+  disks: true
+  raids: true
+  health: true
+  gpu: true        # NVIDIA GPU
+
+mqtt:
+  host: 192.168.1.1
+  port: 1883
+  username: username
+  password: password
+  client_id: SERVER
+  base_topic: SERVER
+  retain: false
+  qos: 0
+  tls: false
+  ca_certs:
+  insecure_tls: false
+  keepalive: 30
+  discovery_enable: true
+  discovery_prefix: homeassistant
+
+device:
+  name: SERVER
+  identifiers: ["SERVER"]
+  manufacturer: "server-status"
+  model: "server-status"
+  sw_version: "1.0"
+
+# map logical keys to mount paths for disk usage
+mounts:
+  root: /
+  storage1: /dev/mapper/storage1
+
+
+# list of block devices to query with HDSentinel -solid
+disks: ["sda","nvmen0n1"]
+
+# list of mdadm arrays to read "Active Devices" from
+raids: ["md0","md1"]
+
+# Optional label to prefer in `sensors` output, like "Tctl:" or "Tdie:"
+cpu_temp_label: "Tctl:"
+
+# MQTT availability topic. Default is <base_topic>/availability if omitted.
+availability_topic:
+
+# If set, run forever with this interval in seconds. Omit to run once.
+loop_seconds: 5
+
+# HDSentinel configuration
+# Path to HDSentinel binary
+hdsentinel_path: /root/HDSentinel
+# Other HDSentinel config
+hdsentinel_min_interval_seconds: 1800
+hdsentinel_timeout_seconds: 60
+hdsentinel_cache_path: /var/tmp/server_status_hdsentinel.json
