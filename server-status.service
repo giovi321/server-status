@@ -1,0 +1,18 @@
+[Unit]
+Description=Server Status MQTT Publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/server-status
+ExecStart=/root/server-status/bin/python3 /root/server-status/server-status.py -c /root/server-status/server-status.yaml
+Environment="PATH=/root/server-status/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Restart=always
+RestartSec=15s
+KillMode=process
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=multi-user.target
