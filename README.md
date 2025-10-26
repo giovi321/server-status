@@ -3,12 +3,12 @@
 Publishes key server metrics (CPU, memory, uptime, disk usage, RAID, drive health, and optional NVIDIA GPU) to an MQTT broker with Home Assistant autodiscovery support.  
 All configuration is YAML-based; each module can be toggled individually.
 
----
+
 
 ## Features
 
 | Metric Type | Source | MQTT Topic Prefix | Notes |
-|--------------|---------|-------------------|--------|
+|--||-|--|
 | CPU usage / temp | `/proc/stat`, `sensors` | `<base>/cpu_*` | Temp label customizable |
 | Memory available % | `/proc/meminfo` | `<base>/memory_available` | Uses MemAvailable / MemTotal |
 | Uptime (days) | `/proc/uptime` | `<base>/uptime_days` | 2 decimals if <10 days |
@@ -17,7 +17,7 @@ All configuration is YAML-based; each module can be toggled individually.
 | Drive health | `HDSentinel -solid` | `<base>/health_<disk>` | Cached, throttled (default 30 min) |
 | NVIDIA GPU | `nvidia-smi` | `<base>/gpu/...` | Temp °C, Util %, VRAM % free |
 
----
+
 
 ## Requirements
 
@@ -38,7 +38,7 @@ python3 -m venv .
 ./bin/pip install paho-mqtt PyYAML
 ```
 
----
+
 
 ## Configuration
 
@@ -79,7 +79,7 @@ loop_seconds: 60
 
 Missing sections or `false` disable that metric entirely.
 
----
+
 
 ## Run manually
 
@@ -92,31 +92,15 @@ Run once and exit:
 ./bin/python3 server-status.py -c server-status.yaml --once
 ```
 
----
+
 
 ## Systemd Service
 
 Create `/etc/systemd/system/server-status.service`:
 
-```
-[Unit]
-Description=Server Status MQTT Publisher
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/server-status
-ExecStart=/root/server-status/bin/python3 /root/server-status/server-status.py -c /root/server-status/server-status.yaml
-Environment="PATH=/root/server-status/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
-Restart=always
-RestartSec=15s
-KillMode=process
-TimeoutStopSec=5s
-
-[Install]
-WantedBy=multi-user.target
+```bash
+cd ./server-status
+cp server-status.service /etc/systemd/system/server-status.service
 ```
 
 Activate:
@@ -126,7 +110,7 @@ systemctl enable --now server-status.service
 journalctl -u server-status.service -f
 ```
 
----
+
 
 ## MQTT / Home Assistant
 
@@ -142,7 +126,7 @@ SERVER/raid/md0
 
 Availability topic: `<base>/availability`.
 
----
+
 
 ## Notes
 
