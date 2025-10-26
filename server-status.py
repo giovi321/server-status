@@ -300,24 +300,71 @@ def read_nvidia_metrics(timeout: int = 3) -> Optional[dict]:
 # HDSentinel parsing and throttling
 # -----------------------------
 def parse_hdsentinel(output: str, disks: List[str]) -> Dict[str, Optional[int]]:
-    result = {d: None for d in disks}
+    """
+    Expected lines like:
+      /dev/nvme0 31 100 3007 ...
+      /dev/sda   30  80  3278 ...
+    We take the SECOND numeric token after the device token as health (0..100).
+    Accepts aliases: 'sda', '/dev/sda', basename tokens.
+    """
+    import os, re
+    res = {d: None for d in disks}
     if not output:
-        return result
-    import re as _re
-    rx = _re.compile(r"(\d{1,3})\s*%")
+        return res
+
+    # Build alias sets per requested disk
+    aliases = {}
     for d in disks:
-        for ln in output.splitlines():
-            if d in ln.split():
-                m = rx.search(ln)
-                if m:
-                    val = int(m.group(1))
-                    if val < 0:
-                        val = 0
-                    if val > 100:
-                        val = 100
-                    result[d] = val
-                    break
-    return result
+        base = os.path.basename(d)
+        aliases[d] = {d, base, f"/dev/{base}"}
+
+    num_rx = re.compile(r"\d+")
+    for ln in output.splitlines():
+        toks = ln.split()
+        if not toks:
+            continue
+
+        # Find which disk this line belongs to
+        line_ids = {os.path.basename(t) if "/" in t else t for t in toks}
+        line_ids |= {f"/dev/{t}" for t in line_ids}
+        matched = None
+        for d in disks:
+            if aliases[d] & line_ids:
+                matched = d
+                break
+        if not matched:
+            continue
+        if res[matched] is not None:
+            continue
+
+        # Collect numbers AFTER the device token occurrence
+        # Find index of the first token that matches any alias
+        dev_idx = None
+        ali = aliases[matched]
+        for i, t in enumerate(toks):
+            tb = os.path.basename(t) if "/" in t else t
+            if t in ali or tb in ali or f"/dev/{tb}" in ali:
+                dev_idx = i
+                break
+        if dev_idx is None:
+            continue
+
+        tail = " ".join(toks[dev_idx + 1 :])
+        nums = [int(m.group()) for m in num_rx.finditer(tail)]
+        if len(nums) >= 2:
+            health = nums[1]          # second numeric: health
+        elif nums:
+            # fallback: first number in [0..100] that is not the first token
+            health = next((v for v in nums[1:] if 0 <= v <= 100), None)
+            if health is None:
+                health = nums[0]
+        else:
+            continue
+
+        health = max(0, min(100, int(health)))
+        res[matched] = health
+
+    return res
 
 def _read_hdsentinel_cache(path: str):
     try:
