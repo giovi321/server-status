@@ -8,6 +8,8 @@ modules:
   raids: true
   health: true
   gpu: true        # NVIDIA GPU
+  apt_updates: true
+  docker_updates: true
 
 mqtt:
   host: 192.168.1.1
@@ -60,3 +62,9 @@ hdsentinel_path: /root/HDSentinel
 hdsentinel_min_interval_seconds: 1800
 hdsentinel_timeout_seconds: 60
 hdsentinel_cache_path: /var/tmp/server_status_hdsentinel.json
+
+apt_min_interval_seconds: 3600
+apt_cache_path: /var/tmp/server_status_apt.json
+
+docker_min_interval_seconds: 21600
+docker_cache_path: /var/tmp/server_status_docker.json
