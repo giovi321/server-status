@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# server-status.py
+
 import argparse
 import json
 import os
@@ -10,19 +12,23 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 try:
-    import yaml  # PyYAML
+    import yaml
 except Exception:
-    print("Missing dependency: PyYAML. Install with: pip install pyyaml paho-mqtt", file=sys.stderr)
+    print("Missing dependency: PyYAML. Install with: pip install pyyaml", file=sys.stderr)
     raise
 
 try:
     import paho.mqtt.client as mqtt
+    try:
+        from paho.mqtt.client import CallbackAPIVersion  # paho >=2
+    except Exception:
+        CallbackAPIVersion = None
 except Exception:
     print("Missing dependency: paho-mqtt. Install with: pip install paho-mqtt", file=sys.stderr)
     raise
 
 # -----------------------------
-# Data classes
+# Config structures
 # -----------------------------
 @dataclass
 class MQTTConfig:
@@ -55,72 +61,71 @@ class ModulesConfig:
     cpu_temp: bool = True
     memory: bool = True
     uptime: bool = True
-    disks: bool = True      # mount usage
+    disks: bool = True
     raids: bool = True
-    health: bool = True     # HDSentinel
-    gpu: bool = True        # NVIDIA GPU via nvidia-smi
+    health: bool = True
+    gpu: bool = True
+    apt_updates: bool = True
+    docker_updates: bool = True
 
 @dataclass
 class Config:
     mqtt: MQTTConfig
     device: DeviceConfig
     modules: ModulesConfig
-    mounts: Optional[Dict[str, str]]
-    disks: Optional[List[str]]
-    raids: Optional[List[str]]
+    mounts: Optional[Dict[str, str]] = None
+    disks: Optional[List[str]] = None
+    raids: Optional[List[str]] = None
     hdsentinel_path: str = "/root/HDSentinel"
     hdsentinel_min_interval_seconds: int = 1800
     hdsentinel_timeout_seconds: int = 60
     hdsentinel_cache_path: str = "/var/tmp/server_status_hdsentinel.json"
+    apt_min_interval_seconds: int = 3600
+    apt_cache_path: str = "/var/tmp/server_status_apt.json"
+    docker_min_interval_seconds: int = 21600
+    docker_cache_path: str = "/var/tmp/server_status_docker.json"
     cpu_temp_label: Optional[str] = None
     availability_topic: Optional[str] = None
-    loop_seconds: Optional[int] = None
+    loop_seconds: Optional[int] = 60
 
-# -----------------------------
-# Config
-# -----------------------------
 def load_config(path: str) -> Config:
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
-
     mqtt_cfg = MQTTConfig(**raw["mqtt"])
     dev_cfg = DeviceConfig(**raw["device"])
-
-    modules_raw = raw.get("modules", {})
-    modules_cfg = ModulesConfig(
-        cpu_usage=modules_raw.get("cpu_usage", True),
-        cpu_temp=modules_raw.get("cpu_temp", True),
-        memory=modules_raw.get("memory", True),
-        uptime=modules_raw.get("uptime", True),
-        disks=modules_raw.get("disks", True),
-        raids=modules_raw.get("raids", True),
-        health=modules_raw.get("health", True),
-        gpu=modules_raw.get("gpu", True),
+    mraw = raw.get("modules", {})
+    modules = ModulesConfig(
+        cpu_usage=mraw.get("cpu_usage", True),
+        cpu_temp=mraw.get("cpu_temp", True),
+        memory=mraw.get("memory", True),
+        uptime=mraw.get("uptime", True),
+        disks=mraw.get("disks", True),
+        raids=mraw.get("raids", True),
+        health=mraw.get("health", True),
+        gpu=mraw.get("gpu", True),
+        apt_updates=mraw.get("apt_updates", True),
+        docker_updates=mraw.get("docker_updates", True),
     )
-
-    mounts = raw.get("mounts")
-    disks = raw.get("disks")
-    raids = raw.get("raids")
-
     return Config(
         mqtt=mqtt_cfg,
         device=dev_cfg,
-        modules=modules_cfg,
-        mounts=mounts,
-        disks=disks,
-        raids=raids,
+        modules=modules,
+        mounts=raw.get("mounts"),
+        disks=raw.get("disks"),
+        raids=raw.get("raids"),
         hdsentinel_path=raw.get("hdsentinel_path", "/root/HDSentinel"),
         hdsentinel_min_interval_seconds=raw.get("hdsentinel_min_interval_seconds", 1800),
         hdsentinel_timeout_seconds=raw.get("hdsentinel_timeout_seconds", 60),
         hdsentinel_cache_path=raw.get("hdsentinel_cache_path", "/var/tmp/server_status_hdsentinel.json"),
+        apt_min_interval_seconds=raw.get("apt_min_interval_seconds", 3600),
+        apt_cache_path=raw.get("apt_cache_path", "/var/tmp/server_status_apt.json"),
+        docker_min_interval_seconds=raw.get("docker_min_interval_seconds", 21600),
+        docker_cache_path=raw.get("docker_cache_path", "/var/tmp/server_status_docker.json"),
         cpu_temp_label=raw.get("cpu_temp_label"),
         availability_topic=raw.get("availability_topic"),
-        loop_seconds=raw.get("loop_seconds"),
+        loop_seconds=raw.get("loop_seconds", 60),
     )
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def run(cmd: List[str], timeout: int = 5) -> str:
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False, text=True)
@@ -146,25 +151,17 @@ def read_cpu_usage_one_second() -> float:
     n2, t2 = read_stat()
     delta = max(1, t2 - t1)
     usage = (n2 - n1) * 100.0 / delta
-    if usage < 0:
-        usage = 0.0
-    if usage > 100.0:
-        usage = 100.0
-    return usage
+    return max(0.0, min(100.0, usage))
 
 def read_cpu_temp_w_sensors(preferred_label: Optional[str]) -> Optional[float]:
     out = run(["/usr/bin/sensors"])
     if not out:
         return None
-
     import re
     lines = out.splitlines()
-
     def temp_in(s: str) -> Optional[float]:
-        m = re.search(r'([-+]?\d+(?:\.\d+)?)\s*°?C', s)
+        m = re.search(r'([-+]?\\d+(?:\\.\\d+)?)\\s*°?C', s)
         return float(m.group(1)) if m else None
-
-    # 1) Exact label match, parse only AFTER the first colon
     if preferred_label:
         key = preferred_label.rstrip(":").strip()
         for ln in lines:
@@ -174,9 +171,7 @@ def read_cpu_temp_w_sensors(preferred_label: Optional[str]) -> Optional[float]:
                 v = temp_in(part)
                 if v is not None:
                     return v
-
-    # 2) Common labels fallback (still parse only after colon)
-    for lab in [l for l in ["Tctl", "Tdie", "Package id 0", "Composite", "CPU"] if not preferred_label or l != preferred_label.rstrip(":").strip()]:
+    for lab in ["Tctl", "Tdie", "Package id 0", "Composite", "CPU"]:
         for ln in lines:
             s = ln.strip()
             if s.startswith(lab + ":"):
@@ -184,13 +179,10 @@ def read_cpu_temp_w_sensors(preferred_label: Optional[str]) -> Optional[float]:
                 v = temp_in(part)
                 if v is not None:
                     return v
-
-    # 3) Last resort: first temperature anywhere
     for ln in lines:
         v = temp_in(ln)
         if v is not None:
             return v
-
     return None
 
 def _mount_source_to_target_map() -> Dict[str, str]:
@@ -200,15 +192,13 @@ def _mount_source_to_target_map() -> Dict[str, str]:
             for ln in f:
                 parts = ln.split()
                 if len(parts) >= 2:
-                    src = parts[0]
-                    tgt = parts[1]
+                    src = parts[0]; tgt = parts[1]
                     m[src] = tgt
     except Exception:
         pass
     return m
 
 _MOUNT_MAP = None
-
 def resolve_path_to_mountpoint(path: str) -> str:
     global _MOUNT_MAP
     if os.path.isdir(path):
@@ -248,8 +238,7 @@ def memory_available_percent() -> Optional[float]:
                     val = parts[1].strip().split()[0]
                     if val.isdigit():
                         mem[key] = int(val)
-        total = mem.get("MemTotal")
-        avail = mem.get("MemAvailable")
+        total = mem.get("MemTotal"); avail = mem.get("MemAvailable")
         if total and avail:
             return avail * 100.0 / total
     except Exception:
@@ -260,84 +249,25 @@ def uptime_days() -> Optional[float]:
     try:
         with open("/proc/uptime") as f:
             s = f.read().split()[0]
-            seconds = float(s)
-            return seconds / 86400.0
+            return float(s) / 86400.0
     except Exception:
         return None
 
-
-# -----------------------------
-# NVIDIA GPU via nvidia-smi
-# -----------------------------
-def read_nvidia_metrics(timeout: int = 3) -> Optional[dict]:
-    """Return dict with temp_c, util_pct, mem_avail_pct using nvidia-smi.
-    Requires NVIDIA drivers and nvidia-smi present. Returns None if unavailable.
-    """
-    smi = "/usr/bin/nvidia-smi"
-    if not os.path.isfile(smi):
-        # fallback: search in PATH
-        for p in os.getenv("PATH", "").split(os.pathsep):
-            cand = os.path.join(p, "nvidia-smi")
-            if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                smi = cand
-                break
-        else:
-            return None
-    # Query: temperature.gpu, utilization.gpu, memory.total, memory.free
-    out = run([smi, "--query-gpu=temperature.gpu,utilization.gpu,memory.total,memory.free", "--format=csv,noheader,nounits"], timeout=timeout)
-    if not out:
-        return None
-    # Support multiple GPUs: take the first line
-    line = out.strip().splitlines()[0].strip()
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) < 4:
-        return None
-    try:
-        temp_c = float(parts[0])
-        util_pct = float(parts[1])
-        mem_total = float(parts[2])  # MiB
-        mem_free = float(parts[3])   # MiB
-        if mem_total <= 0:
-            mem_avail_pct = None
-        else:
-            mem_avail_pct = mem_free * 100.0 / mem_total
-        return {
-            "temp_c": temp_c,
-            "util_pct": util_pct,
-            "mem_avail_pct": mem_avail_pct,
-        }
-    except Exception:
-        return None
-
-# -----------------------------
-# HDSentinel parsing and throttling
-# -----------------------------
 def parse_hdsentinel(output: str, disks: List[str]) -> Dict[str, Optional[int]]:
-    """
-    Expected lines like:
-      /dev/nvme0 31 100 3007 ...
-      /dev/sda   30  80  3278 ...
-    We take the SECOND numeric token after the device token as health (0..100).
-    Accepts aliases: 'sda', '/dev/sda', basename tokens.
-    """
+    # Health is the second numeric token after the device token.
     import os, re
     res = {d: None for d in disks}
     if not output:
         return res
-
-    # Build alias sets per requested disk
+    num_rx = re.compile(r"\\d+")
     aliases = {}
     for d in disks:
         base = os.path.basename(d)
         aliases[d] = {d, base, f"/dev/{base}"}
-
-    num_rx = re.compile(r"\d+")
     for ln in output.splitlines():
         toks = ln.split()
         if not toks:
             continue
-
-        # Find which disk this line belongs to
         line_ids = {os.path.basename(t) if "/" in t else t for t in toks}
         line_ids |= {f"/dev/{t}" for t in line_ids}
         matched = None
@@ -345,53 +275,38 @@ def parse_hdsentinel(output: str, disks: List[str]) -> Dict[str, Optional[int]]:
             if aliases[d] & line_ids:
                 matched = d
                 break
-        if not matched:
+        if not matched or res[matched] is not None:
             continue
-        if res[matched] is not None:
-            continue
-
-        # Collect numbers AFTER the device token occurrence
-        # Find index of the first token that matches any alias
         dev_idx = None
         ali = aliases[matched]
         for i, t in enumerate(toks):
             tb = os.path.basename(t) if "/" in t else t
             if t in ali or tb in ali or f"/dev/{tb}" in ali:
-                dev_idx = i
-                break
+                dev_idx = i; break
         if dev_idx is None:
             continue
-
-        tail = " ".join(toks[dev_idx + 1 :])
+        tail = " ".join(toks[dev_idx+1:])
         nums = [int(m.group()) for m in num_rx.finditer(tail)]
-        if len(nums) >= 2:
-            health = nums[1]          # second numeric: health
-        elif nums:
-            # fallback: first number in [0..100] that is not the first token
-            health = next((v for v in nums[1:] if 0 <= v <= 100), None)
-            if health is None:
-                health = nums[0]
-        else:
+        if not nums:
             continue
-
+        health = nums[1] if len(nums) >= 2 else nums[0]
         health = max(0, min(100, int(health)))
         res[matched] = health
-
     return res
 
-def _read_hdsentinel_cache(path: str):
+def _read_json(path: str):
     try:
         with open(path, "r") as f:
             return json.load(f)
     except Exception:
         return None
 
-def _write_hdsentinel_cache(path: str, data: dict):
+def _write_json(path: str, obj: dict):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(data, f)
+            json.dump(obj, f)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -402,13 +317,10 @@ def hdsentinel_health(hdsentinel_path: str,
                       timeout_s: int,
                       cache_path: str) -> Dict[str, Optional[int]]:
     now = int(time.time())
-    cached = _read_hdsentinel_cache(cache_path)
-    if cached and isinstance(cached, dict):
-        last = int(cached.get("ts", 0))
-        if now - last < int(min_interval):
-            cached_vals = cached.get("values", {})
-            return {d: cached_vals.get(d) for d in disks}
-
+    cached = _read_json(cache_path)
+    if cached and now - int(cached.get("ts", 0)) < int(min_interval):
+        vals = cached.get("values", {})
+        return {d: vals.get(d) for d in disks}
     if not disks or not os.path.isfile(hdsentinel_path):
         vals = {d: None for d in disks}
     else:
@@ -421,13 +333,176 @@ def hdsentinel_health(hdsentinel_path: str,
             for d in disks:
                 if vals[d] is None and v2.get(d) is not None:
                     vals[d] = v2[d]
-
-    _write_hdsentinel_cache(cache_path, {"ts": now, "values": vals})
+    _write_json(cache_path, {"ts": now, "values": vals})
     return vals
 
-# -----------------------------
-# mdadm
-# -----------------------------
+def read_nvidia_metrics(timeout: int = 3) -> Optional[dict]:
+    smi = "/usr/bin/nvidia-smi"
+    if not os.path.isfile(smi):
+        for p in os.getenv("PATH", "").split(os.pathsep):
+            cand = os.path.join(p, "nvidia-smi")
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                smi = cand; break
+        else:
+            return None
+    out = run([smi, "--query-gpu=temperature.gpu,utilization.gpu,memory.total,memory.free", "--format=csv,noheader,nounits"], timeout=timeout)
+    if not out:
+        return None
+    line = out.strip().splitlines()[0].strip()
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) < 4:
+        return None
+    try:
+        temp_c = float(parts[0]); util = float(parts[1])
+        total = float(parts[2]); free = float(parts[3])
+        mem_avail = None if total <= 0 else free * 100.0 / total
+        return {"temp_c": temp_c, "util_pct": util, "mem_avail_pct": mem_avail}
+    except Exception:
+        return None
+
+def apt_updates_count(timeout: int = 30) -> Optional[int]:
+    out = run(["/usr/bin/apt-get", "-s", "dist-upgrade"], timeout=timeout)
+    cnt = 0
+    if out:
+        for ln in out.splitlines():
+            if ln.startswith("Inst "):
+                cnt += 1
+        if cnt > 0:
+            return cnt
+    out2 = run(["/usr/bin/apt", "list", "--upgradeable"], timeout=timeout)
+    if out2:
+        lines = [l for l in out2.splitlines() if l and not l.startswith("Listing...")]
+        return max(0, len(lines))
+    return None
+
+def cached_apt_updates(min_interval: int, cache_path: str) -> Optional[int]:
+    now = int(time.time())
+    cached = _read_json(cache_path)
+    if cached and now - int(cached.get("ts", 0)) < int(min_interval):
+        return cached.get("count")
+    val = apt_updates_count()
+    _write_json(cache_path, {"ts": now, "count": val})
+    return val
+
+def docker_updates_count(timeout: int = 120) -> Optional[int]:
+    ps = run(["/usr/bin/docker", "ps", "--format", "{{.Image}}"], timeout=15)
+    if not ps:
+        return None
+    images = sorted(set([l.strip() for l in ps.splitlines() if l.strip()]))
+    updates = 0
+    for img in images:
+        out = run(["/usr/bin/docker", "pull", img], timeout=timeout)
+        if not out:
+            continue
+        low = out.lower()
+        if "downloaded newer image" in low or "status: downloaded newer image" in low:
+            updates += 1
+    return updates
+
+def cached_docker_updates(min_interval: int, cache_path: str) -> Optional[int]:
+    now = int(time.time())
+    cached = _read_json(cache_path)
+    if cached and now - int(cached.get("ts", 0)) < int(min_interval):
+        return cached.get("count")
+    val = docker_updates_count()
+    _write_json(cache_path, {"ts": now, "count": val})
+    return val
+
+def ha_sensor_config(sensor_id: str, name: str, state_topic: str, unit: Optional[str],
+                     device_class: Optional[str], mqtt_cfg: MQTTConfig, device: DeviceConfig,
+                     availability_topic: Optional[str]):
+    payload = {
+        "name": name,
+        "state_topic": state_topic,
+        "unique_id": sensor_id,
+        "qos": mqtt_cfg.qos,
+        "retain": mqtt_cfg.retain,
+        "device": {"identifiers": device.identifiers, "name": device.name},
+        "state_class": "measurement",
+    }
+    if unit: payload["unit_of_measurement"] = unit
+    if device_class: payload["device_class"] = device_class
+    if availability_topic: payload["availability_topic"] = availability_topic
+    if device.manufacturer: payload["device"]["manufacturer"] = device.manufacturer
+    if device.model: payload["device"]["model"] = device.model
+    if device.sw_version: payload["device"]["sw_version"] = device.sw_version
+    return payload
+
+def safe_publish(client, topic: str, payload: str, cfg: MQTTConfig):
+    try:
+        if not client.is_connected():
+            return
+        client.publish(topic, payload=payload, qos=cfg.qos, retain=cfg.retain)
+    except Exception:
+        pass
+
+def _publish_discovery(client, cfg: Config, base: str, avail_topic: str):
+    if not cfg.mqtt.discovery_enable:
+        return
+    disc = cfg.mqtt.discovery_prefix.rstrip("/")
+    node = base.replace("/", "_")
+    def ha(sensor_id, name, state_topic, unit=None, device_class=None):
+        payload = ha_sensor_config(sensor_id, name, state_topic, unit, device_class,
+                                   cfg.mqtt, cfg.device, avail_topic)
+        safe_publish(client, f"{disc}/sensor/{node}/{sensor_id}/config", json.dumps(payload), cfg.mqtt)
+    if cfg.modules.cpu_usage: ha(f"{node}_cpu_usage", "CPU Usage", f"{base}/cpu_usage", "%")
+    if cfg.modules.cpu_temp:  ha(f"{node}_cpu_temp", "CPU Temp", f"{base}/cpu_temp", "°C", "temperature")
+    if cfg.modules.memory:    ha(f"{node}_memory_available", "Memory Available", f"{base}/memory_available", "%")
+    if cfg.modules.uptime:    ha(f"{node}_uptime_days", "Uptime", f"{base}/uptime_days", "d")
+    if cfg.modules.disks and cfg.mounts:
+        for key in cfg.mounts.keys():
+            ha(f"{node}_disk_usage_{key}", f"Disk Usage {key}", f"{base}/disk_usage/{key}", "%")
+    if cfg.modules.health and cfg.disks:
+        for d in cfg.disks:
+            ha(f"{node}_health_{d}", f"Health {d}", f"{base}/health_{d}", "%")
+    if cfg.modules.gpu:
+        ha(f"{node}_gpu_temp", "GPU Temp", f"{base}/gpu/temp", "°C", "temperature")
+        ha(f"{node}_gpu_util", "GPU Utilization", f"{base}/gpu/util", "%")
+        ha(f"{node}_gpu_mem_available", "GPU Memory Available", f"{base}/gpu/mem_available", "%")
+    if cfg.modules.apt_updates:
+        ha(f"{node}_apt_updates", "APT Updates Available", f"{base}/updates/apt")
+    if cfg.modules.docker_updates:
+        ha(f"{node}_docker_updates", "Docker Image Updates", f"{base}/updates/docker")
+
+def connect_mqtt(cfg: Config, base: str, avail_topic: str):
+    try:
+        client = mqtt.Client(client_id=(cfg.mqtt.client_id or f"server-status-{socket.gethostname()}"),
+                             userdata=None,
+                             protocol=mqtt.MQTTv311,
+                             transport="tcp",
+                             callback_api_version=(CallbackAPIVersion.V5 if CallbackAPIVersion else None))
+    except Exception:
+        client = mqtt.Client(client_id=(cfg.mqtt.client_id or f"server-status-{socket.gethostname()}"),
+                             userdata=None,
+                             protocol=mqtt.MQTTv311,
+                             transport="tcp")
+    if cfg.mqtt.username:
+        client.username_pw_set(cfg.mqtt.username, cfg.mqtt.password or "")
+    if cfg.mqtt.tls:
+        client.tls_set(ca_certs=cfg.mqtt.ca_certs)
+        if cfg.mqtt.insecure_tls:
+            client.tls_insecure_set(True)
+    client.will_set(avail_topic, "offline", qos=cfg.mqtt.qos, retain=True)
+
+    def on_connect(cl, userdata, flags, rc, properties=None):
+        ok = (rc == 0) or (getattr(rc, "value", None) == 0)
+        if ok:
+            safe_publish(client, avail_topic, "online", cfg.mqtt)
+            _publish_discovery(client, cfg, base, avail_topic)
+
+    def on_disconnect(cl, userdata, rc, properties=None):
+        pass
+
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    try:
+        client.reconnect_delay_set(min_delay=5, max_delay=60)
+    except Exception:
+        pass
+    client.connect_async(cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.keepalive)
+    client.loop_start()
+    return client
+
 def mdadm_active_devices(arr: str) -> Optional[int]:
     out = run(["/usr/sbin/mdadm", "-D", f"/dev/{arr}"], timeout=5)
     if not out:
@@ -439,236 +514,68 @@ def mdadm_active_devices(arr: str) -> Optional[int]:
                 return int(digits)
     return None
 
-# -----------------------------
-# MQTT helpers
-# -----------------------------
-def ha_sensor_config(sensor_id: str,
-                     name: str,
-                     state_topic: str,
-                     unit: Optional[str],
-                     device_class: Optional[str],
-                     mqtt_cfg: MQTTConfig,
-                     device: DeviceConfig,
-                     availability_topic: Optional[str]):
-    payload = {
-        "name": name,
-        "state_topic": state_topic,
-        "unique_id": sensor_id,
-        "qos": mqtt_cfg.qos,
-        "retain": mqtt_cfg.retain,
-        "device": {
-            "identifiers": device.identifiers,
-            "name": device.name,
-        },
-        "state_class": "measurement",
-    }
-    if unit:
-        payload["unit_of_measurement"] = unit
-    if device_class:
-        payload["device_class"] = device_class
-    if availability_topic:
-        payload["availability_topic"] = availability_topic
-    if device.manufacturer:
-        payload["device"]["manufacturer"] = device.manufacturer
-    if device.model:
-        payload["device"]["model"] = device.model
-    if device.sw_version:
-        payload["device"]["sw_version"] = device.sw_version
-    return payload
-
-def connect_mqtt(cfg: MQTTConfig) -> mqtt.Client:
-    cid = cfg.client_id or f"server-status-{socket.gethostname()}"
-    try:
-        # Paho ≥2.0: request new callback API explicitly
-        client = mqtt.Client(
-            client_id=cid,
-            userdata=None,
-            protocol=mqtt.MQTTv311,  # or mqtt.MQTTv5
-            transport="tcp",
-            callback_api_version=mqtt.CallbackAPIVersion.V5
-        )
-    except AttributeError:
-        # Older Paho without CallbackAPIVersion enum
-        client = mqtt.Client(client_id=cid, userdata=None, protocol=mqtt.MQTTv311, transport="tcp")
-
-    if cfg.username:
-        client.username_pw_set(cfg.username, cfg.password or "")
-    if cfg.tls:
-        client.tls_set(ca_certs=cfg.ca_certs)
-        if cfg.insecure_tls:
-            client.tls_insecure_set(True)
-    client.connect(cfg.host, cfg.port, cfg.keepalive)
-    return client
-
-def publish(client: mqtt.Client, topic: str, payload: str, cfg: MQTTConfig):
-    client.publish(topic, payload=payload, qos=cfg.qos, retain=cfg.retain)
-
-def publish_availability(client: mqtt.Client, avail_topic: str, online: bool, cfg: MQTTConfig):
-    publish(client, avail_topic, "online" if online else "offline", cfg)
-
-def clamp_round(x: Optional[float], ndigits: int = 0) -> Optional[float]:
-    if x is None:
-        return None
-    return round(x, ndigits)
-
-# -----------------------------
-# Main
-# -----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Publish server status to MQTT with optional Home Assistant discovery.")
-    ap.add_argument("-c", "--config", required=True, help="Path to YAML config file.")
-    ap.add_argument("--once", action="store_true", help="Run once and exit even if loop_seconds is set.")
+    ap = argparse.ArgumentParser(description="Publish server metrics to MQTT + Home Assistant discovery.")
+    ap.add_argument("-c", "--config", required=True, help="Path to YAML config file")
+    ap.add_argument("--once", action="store_true", help="Run one cycle then exit")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    mqtt_cfg = cfg.mqtt
-    base = mqtt_cfg.base_topic.rstrip("/")
+    base = cfg.mqtt.base_topic.rstrip("/")
     avail_topic = cfg.availability_topic or f"{base}/availability"
-
-    client = connect_mqtt(mqtt_cfg)
-    client.will_set(avail_topic, "offline", qos=mqtt_cfg.qos, retain=True)
-    client.loop_start()
-    publish_availability(client, avail_topic, True, mqtt_cfg)
-
-    # Discovery
-    if mqtt_cfg.discovery_enable:
-
-        disc = mqtt_cfg.discovery_prefix.rstrip("/")
-        node = base.replace("/", "_")
-
-        # CPU usage
-        if cfg.modules.cpu_usage:
-            cpu_id = f"{node}_cpu_usage"
-            cpu_state = f"{base}/cpu_usage"
-            cpu_cfg = ha_sensor_config(cpu_id, "CPU Usage", cpu_state, "%", None, mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{cpu_id}/config", json.dumps(cpu_cfg), retain=True, qos=mqtt_cfg.qos)
-
-        # CPU temp
-        if cfg.modules.cpu_temp:
-            cput_id = f"{node}_cpu_temp"
-            cput_state = f"{base}/cpu_temp"
-            cput_cfg = ha_sensor_config(cput_id, "CPU Temp", cput_state, "°C", "temperature", mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{cput_id}/config", json.dumps(cput_cfg), retain=True, qos=mqtt_cfg.qos)
-
-        # Memory available
-        if cfg.modules.memory:
-            mem_id = f"{node}_memory_available"
-            mem_state = f"{base}/memory_available"
-            mem_cfg = ha_sensor_config(mem_id, "Memory Available", mem_state, "%", None, mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{mem_id}/config", json.dumps(mem_cfg), retain=True, qos=mqtt_cfg.qos)
-
-        # Uptime
-        if cfg.modules.uptime:
-            up_id = f"{node}_uptime_days"
-            up_state = f"{base}/uptime_days"
-            up_cfg = ha_sensor_config(up_id, "Uptime", up_state, "d", None, mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{up_id}/config", json.dumps(up_cfg), retain=True, qos=mqtt_cfg.qos)
-
-        # Mounts
-        if cfg.modules.disks and cfg.mounts:
-            for key in cfg.mounts.keys():
-                sid = f"{node}_disk_usage_{key}"
-                st = f"{base}/disk_usage/{key}"
-                sc = ha_sensor_config(sid, f"Disk Usage {key}", st, "%", None, mqtt_cfg, cfg.device, avail_topic)
-                client.publish(f"{disc}/sensor/{node}/{sid}/config", json.dumps(sc), retain=True, qos=mqtt_cfg.qos)
-
-        # Disks health
-        if cfg.modules.health and cfg.disks:
-            for d in cfg.disks:
-                sid = f"{node}_health_{d}"
-                st = f"{base}/health_{d}"
-                sc = ha_sensor_config(sid, f"Health {d}", st, "%", None, mqtt_cfg, cfg.device, avail_topic)
-                client.publish(f"{disc}/sensor/{node}/{sid}/config", json.dumps(sc), retain=True, qos=mqtt_cfg.qos)
-
-        # GPU (NVIDIA)
-        if cfg.modules.gpu:
-            gpu_temp_id = f"{node}_gpu_temp"
-            gpu_temp_state = f"{base}/gpu/temp"
-            gpu_temp_cfg = ha_sensor_config(gpu_temp_id, "GPU Temp", gpu_temp_state, "°C", "temperature", mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{gpu_temp_id}/config", json.dumps(gpu_temp_cfg), retain=True, qos=mqtt_cfg.qos)
-
-            gpu_util_id = f"{node}_gpu_util"
-            gpu_util_state = f"{base}/gpu/util"
-            gpu_util_cfg = ha_sensor_config(gpu_util_id, "GPU Utilization", gpu_util_state, "%", None, mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{gpu_util_id}/config", json.dumps(gpu_util_cfg), retain=True, qos=mqtt_cfg.qos)
-
-            gpu_mem_id = f"{node}_gpu_mem_available"
-            gpu_mem_state = f"{base}/gpu/mem_available"
-            gpu_mem_cfg = ha_sensor_config(gpu_mem_id, "GPU Memory Available", gpu_mem_state, "%", None, mqtt_cfg, cfg.device, avail_topic)
-            client.publish(f"{disc}/sensor/{node}/{gpu_mem_id}/config", json.dumps(gpu_mem_cfg), retain=True, qos=mqtt_cfg.qos)
-
-
-        # Raids
-        if cfg.modules.raids and cfg.raids:
-            for arr in cfg.raids:
-                sid = f"{node}_raid_{arr}"
-                st = f"{base}/raid/{arr}"
-                sc = ha_sensor_config(sid, f"RAID {arr} Active", st, None, None, mqtt_cfg, cfg.device, avail_topic)
-                client.publish(f"{disc}/sensor/{node}/{sid}/config", json.dumps(sc), retain=True, qos=mqtt_cfg.qos)
+    client = connect_mqtt(cfg, base, avail_topic)
 
     def one_cycle():
-        # NVIDIA GPU
-        if cfg.modules.gpu:
-            gm = read_nvidia_metrics()
-            if gm:
-                if gm.get("temp_c") is not None:
-                    client.publish(f"{base}/gpu/temp", payload=f"{int(round(gm['temp_c']))}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-                if gm.get("util_pct") is not None:
-                    client.publish(f"{base}/gpu/util", payload=f"{int(round(gm['util_pct']))}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-                if gm.get("mem_avail_pct") is not None:
-                    client.publish(f"{base}/gpu/mem_available", payload=f"{int(round(gm['mem_avail_pct']))}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # CPU usage
         if cfg.modules.cpu_usage:
-            cpu = clamp_round(read_cpu_usage_one_second(), 0)
-            if cpu is not None:
-                client.publish(f"{base}/cpu_usage", payload=f"{int(cpu)}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # CPU temp (not a percentage; one decimal)
+            cpu = int(round(read_cpu_usage_one_second()))
+            safe_publish(client, f"{base}/cpu_usage", f"{cpu}", cfg.mqtt)
         if cfg.modules.cpu_temp:
             ctemp = read_cpu_temp_w_sensors(cfg.cpu_temp_label)
             if ctemp is not None:
-                client.publish(f"{base}/cpu_temp", payload=f"{ctemp:.1f}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # Memory available
+                safe_publish(client, f"{base}/cpu_temp", f"{ctemp:.1f}", cfg.mqtt)
         if cfg.modules.memory:
             mem = memory_available_percent()
             if mem is not None:
-                client.publish(f"{base}/memory_available", payload=f"{int(round(mem))}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # Uptime
+                safe_publish(client, f"{base}/memory_available", f"{int(round(mem))}", cfg.mqtt)
         if cfg.modules.uptime:
             up = uptime_days()
             if up is not None:
                 if up < 10:
-                    client.publish(f"{base}/uptime_days", payload=f"{up:.2f}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
+                    safe_publish(client, f"{base}/uptime_days", f"{up:.2f}", cfg.mqtt)
                 else:
-                    client.publish(f"{base}/uptime_days", payload=f"{int(round(up))}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # Mounts usage
+                    safe_publish(client, f"{base}/uptime_days", f"{int(round(up))}", cfg.mqtt)
         if cfg.modules.disks and cfg.mounts:
             for key, path in cfg.mounts.items():
                 pct = disk_usage_percent(path)
                 if pct is not None:
-                    client.publish(f"{base}/disk_usage/{key}", payload=f"{int(round(pct))}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # HDSentinel
+                    safe_publish(client, f"{base}/disk_usage/{key}", f"{int(round(pct))}", cfg.mqtt)
         if cfg.modules.health and cfg.disks:
-            hs = hdsentinel_health(cfg.hdsentinel_path,
-                                   cfg.disks,
-                                   cfg.hdsentinel_min_interval_seconds,
-                                   cfg.hdsentinel_timeout_seconds,
-                                   cfg.hdsentinel_cache_path)
+            hs = hdsentinel_health(cfg.hdsentinel_path, cfg.disks, cfg.hdsentinel_min_interval_seconds, cfg.hdsentinel_timeout_seconds, cfg.hdsentinel_cache_path)
             for d, val in hs.items():
                 if val is not None:
-                    client.publish(f"{base}/health_{d}", payload=f"{int(val)}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
-
-        # mdadm
+                    safe_publish(client, f"{base}/health_{d}", f"{int(val)}", cfg.mqtt)
+        if cfg.modules.gpu:
+            gm = read_nvidia_metrics()
+            if gm:
+                if gm.get("temp_c") is not None:
+                    safe_publish(client, f"{base}/gpu/temp", f"{int(round(gm['temp_c']))}", cfg.mqtt)
+                if gm.get("util_pct") is not None:
+                    safe_publish(client, f"{base}/gpu/util", f"{int(round(gm['util_pct']))}", cfg.mqtt)
+                if gm.get("mem_avail_pct") is not None:
+                    safe_publish(client, f"{base}/gpu/mem_available", f"{int(round(gm['mem_avail_pct']))}", cfg.mqtt)
+        if cfg.modules.apt_updates:
+            cnt = cached_apt_updates(cfg.apt_min_interval_seconds, cfg.apt_cache_path)
+            if cnt is not None:
+                safe_publish(client, f"{base}/updates/apt", f"{int(cnt)}", cfg.mqtt)
+        if cfg.modules.docker_updates:
+            cnt = cached_docker_updates(cfg.docker_min_interval_seconds, cfg.docker_cache_path)
+            if cnt is not None:
+                safe_publish(client, f"{base}/updates/docker", f"{int(cnt)}", cfg.mqtt)
         if cfg.modules.raids and cfg.raids:
             for arr in cfg.raids:
                 val = mdadm_active_devices(arr)
                 if val is not None:
-                    client.publish(f"{base}/raid/{arr}", payload=f"{int(val)}", qos=mqtt_cfg.qos, retain=mqtt_cfg.retain)
+                    safe_publish(client, f"{base}/raid/{arr}", f"{int(val)}", cfg.mqtt)
 
     try:
         if cfg.loop_seconds and not args.once:
@@ -679,10 +586,13 @@ def main():
         else:
             one_cycle()
     finally:
-        publish_availability(client, avail_topic, False, mqtt_cfg)
-        time.sleep(0.1)
-        client.loop_stop()
-        client.disconnect()
+        try:
+            safe_publish(client, avail_topic, "offline", cfg.mqtt)
+            time.sleep(0.1)
+            client.loop_stop()
+            client.disconnect()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
