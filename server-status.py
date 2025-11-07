@@ -159,26 +159,36 @@ def read_cpu_temp_w_sensors(preferred_label: Optional[str]) -> Optional[float]:
         return None
     import re
     lines = out.splitlines()
+
     def temp_in(s: str) -> Optional[float]:
-        m = re.search(r'([-+]?\\d+(?:\\.\\d+)?)\\s*°?C', s)
+        m = re.search(r'([-+]?\d+(?:\.\d+)?)\s*°?C', s)
         return float(m.group(1)) if m else None
+
+    # 1) Exact label, but match anywhere left of the first colon (robust to spacing/case)
     if preferred_label:
-        key = preferred_label.rstrip(":").strip()
+        key = preferred_label.strip().rstrip(":").lower()
         for ln in lines:
-            s = ln.strip()
-            if s.startswith(key + ":"):
-                part = s.split(":", 1)[1]
-                v = temp_in(part)
+            if ":" not in ln:
+                continue
+            left, right = ln.split(":", 1)
+            if key in left.strip().lower():
+                v = temp_in(right)
                 if v is not None:
                     return v
+
+    # 2) Fallbacks
     for lab in ["Tctl", "Tdie", "Package id 0", "Composite", "CPU"]:
+        k = lab.lower()
         for ln in lines:
-            s = ln.strip()
-            if s.startswith(lab + ":"):
-                part = s.split(":", 1)[1]
-                v = temp_in(part)
+            if ":" not in ln:
+                continue
+            left, right = ln.split(":", 1)
+            if k in left.strip().lower():
+                v = temp_in(right)
                 if v is not None:
                     return v
+
+    # 3) Last resort: first temperature anywhere
     for ln in lines:
         v = temp_in(ln)
         if v is not None:
