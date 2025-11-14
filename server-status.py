@@ -7,6 +7,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -500,8 +501,40 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
             safe_publish(client, avail_topic, "online", cfg.mqtt)
             _publish_discovery(client, cfg, base, avail_topic)
 
+    reconnect_state = {"in_progress": False}
+    reconnect_lock = threading.Lock()
+
+    def _attempt_reconnect():
+        delay = 5
+        while True:
+            try:
+                client.reconnect()
+                return
+            except Exception:
+                try:
+                    client.connect_async(cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.keepalive)
+                except Exception:
+                    pass
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+
     def on_disconnect(cl, userdata, rc, properties=None):
-        pass
+        ok = (rc == 0) or (getattr(rc, "value", None) == 0)
+        if ok:
+            return
+        with reconnect_lock:
+            if reconnect_state["in_progress"]:
+                return
+            reconnect_state["in_progress"] = True
+
+        def worker():
+            try:
+                _attempt_reconnect()
+            finally:
+                with reconnect_lock:
+                    reconnect_state["in_progress"] = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
