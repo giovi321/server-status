@@ -507,6 +507,9 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
     def _attempt_reconnect():
         delay = 5
         while True:
+            # If the network loop has already restored the session, we can exit.
+            if client.is_connected():
+                return
             try:
                 client.reconnect()
                 return
@@ -515,8 +518,8 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
                     client.connect_async(cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.keepalive)
                 except Exception:
                     pass
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
 
     def on_disconnect(cl, userdata, rc, properties=None):
         ok = (rc == 0) or (getattr(rc, "value", None) == 0)
