@@ -439,11 +439,32 @@ def ha_sensor_config(sensor_id: str, name: str, state_topic: str, unit: Optional
     if device.sw_version: payload["device"]["sw_version"] = device.sw_version
     return payload
 
+def _wait_for_connection(client, timeout: float = 10.0) -> bool:
+    """Wait for the MQTT client to report a connected state."""
+    evt = getattr(client, "_connected_event", None)
+    if isinstance(evt, threading.Event):
+        evt.wait(timeout)
+        return client.is_connected()
+    # Fallback if the event was not attached (older configs/tests)
+    start = time.time()
+    while time.time() - start < timeout:
+        if client.is_connected():
+            return True
+        time.sleep(0.1)
+    return client.is_connected()
+
+
 def safe_publish(client, topic: str, payload: str, cfg: MQTTConfig):
     try:
-        if not client.is_connected():
+        if not _wait_for_connection(client, timeout=5.0):
             return
-        client.publish(topic, payload=payload, qos=cfg.qos, retain=cfg.retain)
+        res = client.publish(topic, payload=payload, qos=cfg.qos, retain=cfg.retain)
+        if hasattr(res, "rc") and res.rc != mqtt.MQTT_ERR_SUCCESS:
+            # Trigger the reconnect loop so the next publish has a chance to succeed.
+            try:
+                client.reconnect()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -487,6 +508,8 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
                              userdata=None,
                              protocol=mqtt.MQTTv311,
                              transport="tcp")
+    client._connected_event = threading.Event()
+
     if cfg.mqtt.username:
         client.username_pw_set(cfg.mqtt.username, cfg.mqtt.password or "")
     if cfg.mqtt.tls:
@@ -498,8 +521,11 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
     def on_connect(cl, userdata, flags, rc, properties=None):
         ok = (rc == 0) or (getattr(rc, "value", None) == 0)
         if ok:
+            client._connected_event.set()
             safe_publish(client, avail_topic, "online", cfg.mqtt)
             _publish_discovery(client, cfg, base, avail_topic)
+        else:
+            client._connected_event.clear()
 
     reconnect_state = {"in_progress": False}
     reconnect_lock = threading.Lock()
@@ -507,6 +533,9 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
     def _attempt_reconnect():
         delay = 5
         while True:
+            # If the network loop has already restored the session, we can exit.
+            if client.is_connected():
+                return
             try:
                 client.reconnect()
                 return
@@ -515,13 +544,14 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
                     client.connect_async(cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.keepalive)
                 except Exception:
                     pass
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
 
     def on_disconnect(cl, userdata, rc, properties=None):
         ok = (rc == 0) or (getattr(rc, "value", None) == 0)
         if ok:
             return
+        client._connected_event.clear()
         with reconnect_lock:
             if reconnect_state["in_progress"]:
                 return
@@ -544,6 +574,7 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
         pass
     client.connect_async(cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.keepalive)
     client.loop_start()
+    _wait_for_connection(client, timeout=10.0)
     return client
 
 def mdadm_active_devices(arr: str) -> Optional[int]:
