@@ -470,12 +470,26 @@ def _wait_for_connection(client, timeout: float = 10.0) -> bool:
     return client.is_connected()
 
 
-def safe_publish(client, topic: str, payload: str, cfg: MQTTConfig, *, cache_state: bool = True):
+def safe_publish(
+    client,
+    topic: str,
+    payload: str,
+    cfg: MQTTConfig,
+    *,
+    cache_state: bool = True,
+    retain: Optional[bool] = None,
+    qos: Optional[int] = None,
+):
     try:
         if not _wait_for_connection(client, timeout=5.0):
             LOG.warning("Skipping publish to %s because client is not connected", topic)
             return
-        res = client.publish(topic, payload=payload, qos=cfg.qos, retain=cfg.retain)
+        res = client.publish(
+            topic,
+            payload=payload,
+            qos=(cfg.qos if qos is None else qos),
+            retain=(cfg.retain if retain is None else retain),
+        )
         if hasattr(res, "rc") and res.rc != mqtt.MQTT_ERR_SUCCESS:
             # Trigger the reconnect loop so the next publish has a chance to succeed.
             LOG.warning("Publish to %s failed with rc=%s; scheduling reconnect", topic, res.rc)
@@ -509,7 +523,14 @@ def _publish_discovery(client, cfg: Config, base: str, avail_topic: str):
     def ha(sensor_id, name, state_topic, unit=None, device_class=None):
         payload = ha_sensor_config(sensor_id, name, state_topic, unit, device_class,
                                    cfg.mqtt, cfg.device, avail_topic)
-        safe_publish(client, f"{disc}/sensor/{node}/{sensor_id}/config", json.dumps(payload), cfg.mqtt, cache_state=False)
+        safe_publish(
+            client,
+            f"{disc}/sensor/{node}/{sensor_id}/config",
+            json.dumps(payload),
+            cfg.mqtt,
+            cache_state=False,
+            retain=True,
+        )
     if cfg.modules.cpu_usage: ha(f"{node}_cpu_usage", "CPU Usage", f"{base}/cpu_usage", "%")
     if cfg.modules.cpu_temp:  ha(f"{node}_cpu_temp", "CPU Temp", f"{base}/cpu_temp", "°C", "temperature")
     if cfg.modules.memory:    ha(f"{node}_memory_available", "Memory Available", f"{base}/memory_available", "%")
@@ -556,7 +577,7 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
         if ok:
             LOG.info("Connected to MQTT broker %s:%s", cfg.mqtt.host, cfg.mqtt.port)
             client._connected_event.set()
-            safe_publish(client, avail_topic, "online", cfg.mqtt, cache_state=False)
+            safe_publish(client, avail_topic, "online", cfg.mqtt, cache_state=False, retain=True)
             _publish_discovery(client, cfg, base, avail_topic)
             _republish_cached_state(client, cfg.mqtt)
         else:
@@ -708,7 +729,7 @@ def main():
             one_cycle()
     finally:
         try:
-            safe_publish(client, avail_topic, "offline", cfg.mqtt, cache_state=False)
+            safe_publish(client, avail_topic, "offline", cfg.mqtt, cache_state=False, retain=True)
             time.sleep(0.1)
             client.loop_stop()
             client.disconnect()
