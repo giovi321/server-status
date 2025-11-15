@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -27,6 +28,14 @@ try:
 except Exception:
     print("Missing dependency: paho-mqtt. Install with: pip install paho-mqtt", file=sys.stderr)
     raise
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+LOG = logging.getLogger("server-status")
 
 # -----------------------------
 # Config structures
@@ -443,8 +452,12 @@ def _wait_for_connection(client, timeout: float = 10.0) -> bool:
     """Wait for the MQTT client to report a connected state."""
     evt = getattr(client, "_connected_event", None)
     if isinstance(evt, threading.Event):
+        LOG.debug("Waiting for MQTT connection (timeout=%ss)", timeout)
         evt.wait(timeout)
-        return client.is_connected()
+        connected = client.is_connected()
+        if not connected:
+            LOG.warning("Timed out waiting for MQTT connection after %ss", timeout)
+        return connected
     # Fallback if the event was not attached (older configs/tests)
     start = time.time()
     while time.time() - start < timeout:
@@ -457,16 +470,19 @@ def _wait_for_connection(client, timeout: float = 10.0) -> bool:
 def safe_publish(client, topic: str, payload: str, cfg: MQTTConfig):
     try:
         if not _wait_for_connection(client, timeout=5.0):
+            LOG.warning("Skipping publish to %s because client is not connected", topic)
             return
         res = client.publish(topic, payload=payload, qos=cfg.qos, retain=cfg.retain)
         if hasattr(res, "rc") and res.rc != mqtt.MQTT_ERR_SUCCESS:
             # Trigger the reconnect loop so the next publish has a chance to succeed.
+            LOG.warning("Publish to %s failed with rc=%s; scheduling reconnect", topic, res.rc)
             try:
                 client.reconnect()
             except Exception:
+                LOG.exception("Immediate reconnect attempt failed")
                 pass
     except Exception:
-        pass
+        LOG.exception("Unhandled exception while publishing to %s", topic)
 
 def _publish_discovery(client, cfg: Config, base: str, avail_topic: str):
     if not cfg.mqtt.discovery_enable:
@@ -521,10 +537,12 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
     def on_connect(cl, userdata, flags, rc, properties=None):
         ok = (rc == 0) or (getattr(rc, "value", None) == 0)
         if ok:
+            LOG.info("Connected to MQTT broker %s:%s", cfg.mqtt.host, cfg.mqtt.port)
             client._connected_event.set()
             safe_publish(client, avail_topic, "online", cfg.mqtt)
             _publish_discovery(client, cfg, base, avail_topic)
         else:
+            LOG.error("MQTT connection failed with rc=%s", rc)
             client._connected_event.clear()
 
     reconnect_state = {"in_progress": False}
@@ -535,14 +553,18 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
         while True:
             # If the network loop has already restored the session, we can exit.
             if client.is_connected():
+                LOG.info("Reconnect loop exiting because client is already connected")
                 return
             try:
+                LOG.info("Attempting MQTT reconnect")
                 client.reconnect()
                 return
             except Exception:
+                LOG.exception("client.reconnect() failed; retrying with connect_async")
                 try:
                     client.connect_async(cfg.mqtt.host, cfg.mqtt.port, cfg.mqtt.keepalive)
                 except Exception:
+                    LOG.exception("connect_async() during reconnect failed")
                     pass
             time.sleep(delay)
             delay = min(delay * 2, 60)
@@ -551,16 +573,20 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
         ok = (rc == 0) or (getattr(rc, "value", None) == 0)
         if ok:
             return
+        LOG.warning("MQTT disconnected (rc=%s); starting reconnect worker", rc)
         client._connected_event.clear()
         with reconnect_lock:
             if reconnect_state["in_progress"]:
+                LOG.debug("Reconnect already in progress; skipping new worker")
                 return
             reconnect_state["in_progress"] = True
 
         def worker():
+            LOG.info("MQTT reconnect worker started")
             try:
                 _attempt_reconnect()
             finally:
+                LOG.info("MQTT reconnect worker finished")
                 with reconnect_lock:
                     reconnect_state["in_progress"] = False
 
@@ -597,6 +623,7 @@ def main():
     cfg = load_config(args.config)
     base = cfg.mqtt.base_topic.rstrip("/")
     avail_topic = cfg.availability_topic or f"{base}/availability"
+    LOG.info("Starting server-status publisher (loop=%ss)", cfg.loop_seconds)
     client = connect_mqtt(cfg, base, avail_topic)
 
     def one_cycle():
@@ -655,9 +682,11 @@ def main():
         if cfg.loop_seconds and not args.once:
             interval = max(5, int(cfg.loop_seconds))
             while True:
+                LOG.debug("Running metrics collection cycle")
                 one_cycle()
                 time.sleep(interval)
         else:
+            LOG.debug("Running single metrics collection cycle")
             one_cycle()
     finally:
         try:
