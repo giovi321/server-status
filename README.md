@@ -7,16 +7,15 @@ All configuration is YAML-based; each module can be toggled individually.
 
 ## Features
 
-| Metric Type | Source | MQTT Topic Prefix | Notes |
-|--||-|--|
-| CPU usage / temp | `/proc/stat`, `sensors` | `<base>/cpu_*` | Temp label customizable |
-| Memory available % | `/proc/meminfo` | `<base>/memory_available` | Uses MemAvailable / MemTotal |
-| Uptime (days) | `/proc/uptime` | `<base>/uptime_days` | 2 decimals if <10 days |
-| Disk usage % | `statvfs` | `<base>/disk_usage/<mount>` | Automatically resolves device → mountpoint |
-| RAID active members | `mdadm -D /dev/mdX` | `<base>/raid/<md>` | Only if listed |
-| Drive health | `HDSentinel -solid` | `<base>/health_<disk>` | Cached, throttled (default 30 min) |
-| NVIDIA GPU | `nvidia-smi` | `<base>/gpu/...` | Temp °C, Util %, VRAM % free |
-
+| Metric Type            | Source                     | MQTT Topic Prefix              | Notes                                      |
+|------------------------|----------------------------|--------------------------------|--------------------------------------------|
+| CPU usage / temp       | `/proc/stat`, `sensors`    | `<base>/cpu_*`                 | Temp label customizable                    |
+| Memory available %     | `/proc/meminfo`            | `<base>/memory_available`      | Uses MemAvailable / MemTotal               |
+| Uptime (days)          | `/proc/uptime`             | `<base>/uptime_days`           | 2 decimals if < 10 days                    |
+| Disk usage %           | `statvfs`                  | `<base>/disk_usage/<mount>`    | Automatically resolves device → mountpoint |
+| RAID active members    | `mdadm -D /dev/mdX`        | `<base>/raid/<md>`             | Only if listed                             |
+| Drive health           | `HDSentinel -solid`        | `<base>/health_<disk>`         | Cached, throttled (default 30 min)         |
+| NVIDIA GPU             | `nvidia-smi`               | `<base>/gpu/...`               | Temp °C, Util %, VRAM % free               |
 
 
 ## Requirements
