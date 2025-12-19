@@ -226,16 +226,32 @@ def resolve_path_to_mountpoint(path: str) -> str:
         pass
     return path
 
+def is_mount_point_accessible(path: str) -> bool:
+    """Check if a mount point is accessible and readable."""
+    try:
+        return os.path.isdir(path) and os.access(path, os.R_OK)
+    except Exception:
+        return False
+
 def disk_usage_percent(path: str) -> Optional[float]:
     try:
         mp = resolve_path_to_mountpoint(path)
+        if not is_mount_point_accessible(mp):
+            print(f"Mount point {mp} (path: {path}) is not accessible", file=sys.stderr)
+            return None
         st = os.statvfs(mp)
         total = st.f_blocks * st.f_frsize
         used = (st.f_blocks - st.f_bfree) * st.f_frsize
         if total <= 0:
+            print(f"Warning: Invalid total size ({total}) for mount point {mp} (path: {path})", file=sys.stderr)
             return None
-        return used * 100.0 / total
-    except Exception:
+        usage = used * 100.0 / total
+        return usage
+    except OSError as e:
+        print(f"OS error getting disk usage for {path} (mount: {mp if 'mp' in locals() else 'unknown'}): {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Unexpected error getting disk usage for {path}: {e}", file=sys.stderr)
         return None
 
 def memory_available_percent() -> Optional[float]:
@@ -592,6 +608,9 @@ def main():
                 pct = disk_usage_percent(path)
                 if pct is not None:
                     safe_publish(client, f"{base}/disk_usage/{key}", f"{int(round(pct))}", cfg.mqtt)
+                else:
+                    # Publish unknown status when disk usage cannot be determined
+                    safe_publish(client, f"{base}/disk_usage/{key}", "unknown", cfg.mqtt)
         if cfg.modules.health and cfg.disks:
             hs = hdsentinel_health(cfg.hdsentinel_path, cfg.disks, cfg.hdsentinel_min_interval_seconds, cfg.hdsentinel_timeout_seconds, cfg.hdsentinel_cache_path)
             for d, val in hs.items():
