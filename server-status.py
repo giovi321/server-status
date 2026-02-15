@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -142,8 +143,17 @@ def load_config(path: str) -> Config:
 def run(cmd: List[str], timeout: int = 5) -> str:
     try:
         out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False, text=True)
+        if out.returncode != 0:
+            LOG.debug("Command %s exited with code %s: %s", cmd[0], out.returncode, out.stderr.strip())
         return out.stdout
+    except FileNotFoundError:
+        LOG.warning("Command not found: %s", cmd[0])
+        return ""
+    except subprocess.TimeoutExpired:
+        LOG.warning("Command timed out after %ss: %s", timeout, cmd[0])
+        return ""
     except Exception:
+        LOG.exception("Unexpected error running %s", cmd[0])
         return ""
 
 def read_cpu_usage_one_second() -> float:
@@ -170,7 +180,6 @@ def read_cpu_temp_w_sensors(preferred_label: Optional[str]) -> Optional[float]:
     out = run(["/usr/bin/sensors"])
     if not out:
         return None
-    import re
     lines = out.splitlines()
 
     def temp_in(s: str) -> Optional[float]:
@@ -294,11 +303,10 @@ def uptime_days() -> Optional[float]:
 
 def parse_hdsentinel(output: str, disks: List[str]) -> Dict[str, Optional[int]]:
     # Health is the second numeric token after the device token.
-    import os, re
     res = {d: None for d in disks}
     if not output:
         return res
-    num_rx = re.compile(r"\\d+")
+    num_rx = re.compile(r"\d+")
     aliases = {}
     for d in disks:
         base = os.path.basename(d)
@@ -557,6 +565,9 @@ def _publish_discovery(client, cfg: Config, base: str, avail_topic: str):
     if cfg.modules.health and cfg.disks:
         for d in cfg.disks:
             ha(f"{node}_health_{d}", f"Health {d}", f"{base}/health_{d}", "%")
+    if cfg.modules.raids and cfg.raids:
+        for arr in cfg.raids:
+            ha(f"{node}_raid_{arr}", f"RAID {arr} Active Devices", f"{base}/raid/{arr}")
     if cfg.modules.gpu:
         ha(f"{node}_gpu_temp", "GPU Temp", f"{base}/gpu/temp", "°C", "temperature")
         ha(f"{node}_gpu_util", "GPU Utilization", f"{base}/gpu/util", "%")
@@ -661,12 +672,16 @@ def connect_mqtt(cfg: Config, base: str, avail_topic: str):
 def mdadm_active_devices(arr: str) -> Optional[int]:
     out = run(["/usr/sbin/mdadm", "-D", f"/dev/{arr}"], timeout=5)
     if not out:
+        LOG.warning("mdadm returned no output for /dev/%s (binary missing, device absent, or permission denied?)", arr)
         return None
     for ln in out.splitlines():
-        if "Active Devices" in ln:
-            digits = "".join(ch for ch in ln if ch.isdigit())
-            if digits.isdigit():
-                return int(digits)
+        if "Active Devices" in ln and ":" in ln:
+            value = ln.split(":", 1)[1].strip()
+            if value.isdigit():
+                return int(value)
+            LOG.warning("Could not parse Active Devices value '%s' for /dev/%s", value, arr)
+            return None
+    LOG.warning("No 'Active Devices' line found in mdadm output for /dev/%s", arr)
     return None
 
 def main():
@@ -735,6 +750,8 @@ def main():
                 val = mdadm_active_devices(arr)
                 if val is not None:
                     safe_publish(client, f"{base}/raid/{arr}", f"{int(val)}", cfg.mqtt)
+                else:
+                    safe_publish(client, f"{base}/raid/{arr}", "unknown", cfg.mqtt)
 
     try:
         if cfg.loop_seconds and not args.once:
